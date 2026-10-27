@@ -31,75 +31,109 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - run: anchor build --verifiable -p $PROGRAM
+    - run: anchor build --verifiable -p "$PROGRAM"
       shell: bash
       env:
         PROGRAM: ${{ inputs.program }}
-    - run: solana-keygen new -o buffer-keypair --no-bip39-passphrase
+    - run: solana-keygen new --force -o "$BUFFER_KEYPAIR_PATH" --no-bip39-passphrase
       shell: bash
-    - run: echo "$KEYPAIR" > ./deploy-keypair.json && chmod 600 ./deploy-keypair.json
+      env:
+        BUFFER_KEYPAIR_PATH: ${{ runner.temp }}/buffer-keypair.json
+    
+    # BDA-1 Fix: Securely write the keypair to a temporary location outside the workspace with strict permissions
+    - run: printf '%s' "$KEYPAIR" > "$KEYPAIR_PATH" && chmod 600 "$KEYPAIR_PATH"
       shell: bash
       env:
         KEYPAIR: ${{ inputs.keypair }}
+        KEYPAIR_PATH: ${{ runner.temp }}/deploy-keypair.json
 
     - name: Buffer Deploy
-      uses: nick-invision/retry@v2
+      # BDA-3 Fix: Uses nick-fields/retry safely pinned to immutable v3.0.2 commit SHA
+      uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08
       with:
         timeout_minutes: 30
         max_attempts: 10
         shell: bash
-        command: solana program write-buffer --buffer ./buffer-keypair -k ./deploy-keypair.json ./target/verifiable/$PROGRAM.so -u $NETWORK > ./buffer.out
+        # BDA-2 Fix: Fully quoted variables to prevent shell injection 
+        command: solana program write-buffer --buffer "$BUFFER_KEYPAIR_PATH" -k "$KEYPAIR_PATH" "./target/verifiable/${PROGRAM}.so" -u "$NETWORK" > ./buffer.out
       env:
         NETWORK: ${{ inputs.network }}
         PROGRAM: ${{ inputs.program }}
+        BUFFER_KEYPAIR_PATH: ${{ runner.temp }}/buffer-keypair.json
+        KEYPAIR_PATH: ${{ runner.temp }}/deploy-keypair.json
 
     - name: IDL Buffer Deploy
-      uses: nick-invision/retry@v2
+      # BDA-3 Fix: Uses securely pinned retry action
+      uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08
       with:
         timeout_minutes: 10
         max_attempts: 10
         shell: bash
-        command: anchor idl write-buffer $PROGRAM_ID --filepath ./target/idl/$PROGRAM.json --provider.cluster $NETWORK --provider.wallet ./deploy-keypair.json > idl-buffer.out
+        # BDA-2 Fix: Fully quoted variables
+        command: anchor idl write-buffer "$PROGRAM_ID" --filepath "./target/idl/${PROGRAM}.json" --provider.cluster "$NETWORK" --provider.wallet "$KEYPAIR_PATH" > idl-buffer.out
       env:
         PROGRAM_ID: ${{ inputs.program-id }}
         PROGRAM: ${{ inputs.program }}
         NETWORK: ${{ inputs.network }}
+        KEYPAIR_PATH: ${{ runner.temp }}/deploy-keypair.json
 
     - name: Set buffer output
       id: buffer-deploy
       shell: bash
       run: |
-        echo "buffer=$(cat buffer.out | sed 's/Buffer: //g' | xargs echo -n)" >> $GITHUB_OUTPUT
-        echo "idl-buffer=$(cat idl-buffer.out | sed 's/Idl buffer created: //g' | xargs echo -n)" >> $GITHUB_OUTPUT
+        # BDA-4 Fix: Robust extraction of buffer output addressing CRLF issues
+        buffer="$(sed -n 's/^Buffer: //p' buffer.out | tail -n 1 | tr -d '\r\n')"
+        idl_buffer="$(sed -n 's/^Idl buffer created: //p' idl-buffer.out | tail -n 1 | tr -d '\r\n')"
+
+        # BDA-4 Fix: Explicit error state if the buffer resolution is empty
+        if [ -z "$buffer" ]; then
+          echo "Failed to read the buffer address from buffer.out" >&2
+          exit 1
+        fi
+
+        echo "buffer=$buffer" >> "$GITHUB_OUTPUT"
+        echo "idl-buffer=$idl_buffer" >> "$GITHUB_OUTPUT"
+        
     - run: echo "buffer=${{ steps.buffer-deploy.outputs.buffer }}"
       shell: bash
     - run: echo "idl-buffer=${{ steps.buffer-deploy.outputs.idl-buffer }}"
       shell: bash
 
     - name: Transfer idl buffer to authority
-      uses: nick-invision/retry@v2
+      uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08
       with:
         timeout_minutes: 10
         max_attempts: 10
         shell: bash
-        command: anchor idl set-authority $IDL_BUFFER --provider.cluster $NETWORK --program-id $PROGRAM_ID --new-authority $AUTHORITY --provider.wallet ./deploy-keypair.json
+        # BDA-2 Fix: Quoted IDL buffer transfer vars
+        command: anchor idl set-authority "$IDL_BUFFER" --provider.cluster "$NETWORK" --program-id "$PROGRAM_ID" --new-authority "$AUTHORITY" --provider.wallet "$KEYPAIR_PATH"
       env:
         IDL_BUFFER: ${{ steps.buffer-deploy.outputs.idl-buffer }}
         AUTHORITY: ${{ inputs.buffer-authority }}
         NETWORK: ${{ inputs.network }}
         PROGRAM_ID: ${{ inputs.program-id }}
+        KEYPAIR_PATH: ${{ runner.temp }}/deploy-keypair.json
 
     - name: Transfer buffer to authority
-      uses: nick-invision/retry@v2
+      uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08
       with:
         timeout_minutes: 10
         max_attempts: 10
         shell: bash
-        command: solana program set-buffer-authority $BUFFER -k ./deploy-keypair.json --new-buffer-authority $AUTHORITY -u $NETWORK
+        # BDA-2 Fix: Quoted buffer transfer vars
+        command: solana program set-buffer-authority "$BUFFER" -k "$KEYPAIR_PATH" --new-buffer-authority "$AUTHORITY" -u "$NETWORK"
       env:
         BUFFER: ${{ steps.buffer-deploy.outputs.buffer }}
         AUTHORITY: ${{ inputs.buffer-authority }}
         NETWORK: ${{ inputs.network }}
+        KEYPAIR_PATH: ${{ runner.temp }}/deploy-keypair.json
 
-    - run: rm ./deploy-keypair.json
+    # BDA-1 Fix: Always clean up keypairs to prevent credentials leakage
+    - name: Clean up keypairs and temporary output
+      if: always()
       shell: bash
+      run: |
+        rm -f "$KEYPAIR_PATH" "$BUFFER_KEYPAIR_PATH" ./buffer.out ./idl-buffer.out
+      env:
+        KEYPAIR_PATH: ${{ runner.temp }}/deploy-keypair.json
+        BUFFER_KEYPAIR_PATH: ${{ runner.temp }}/buffer-keypair.json
